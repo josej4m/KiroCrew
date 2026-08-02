@@ -6426,6 +6426,14 @@
     "widgetPlaceholder": {
       "generating": "wird erstellt…"
     },
+    "windowsTitlebarMenu": {
+      "connection": "Verbindung",
+      "edit": "Bearbeiten",
+      "file": "Datei",
+      "help": "Hilfe",
+      "view": "Ansicht",
+      "window": "Fenster"
+    },
     "workspacePicker": {
       "back": "Zurück",
       "create": "Erstellen",

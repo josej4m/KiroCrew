@@ -4551,6 +4551,14 @@
     "widgetPlaceholder": {
       "generating": "generating…"
     },
+    "windowsTitlebarMenu": {
+      "connection": "Connection",
+      "edit": "Edit",
+      "file": "File",
+      "help": "Help",
+      "view": "View",
+      "window": "Window"
+    },
     "workspacePicker": {
       "back": "Back",
       "create_workspace": "Create Workspace",
