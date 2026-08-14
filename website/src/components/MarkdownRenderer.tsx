@@ -32,7 +32,7 @@ import { api } from '../api/client'
 import { useBlockAssembler, maskInlineCode } from '../hooks/useBlockAssembler'
 import { usePathKind, type PathKind } from '../hooks/usePathKind'
 import { fileIcon } from '../utils/fileIcons'
-import { urlTransform, ALLOWED_PROTOCOLS } from '../utils/urlTransform'
+import { urlTransform, ALLOWED_PROTOCOLS, WINDOWS_ABS_PATH_RE, decodeLocalPath } from '../utils/urlTransform'
 import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
@@ -861,15 +861,27 @@ function ImgWithFallback({
   const compact = useContext(CompactImagesCtx)
   const version = useContext(ImageVersionCtx)
   if (!src) return null
-  const isLocal = src.startsWith('/') || src.startsWith('~') || src.startsWith('.')
+  // A Windows drive/UNC path (`C:/…` — urlTransform passes it through for
+  // image src) is as local as a POSIX `/…` path and must route to
+  // /api/file-raw the same way; it must NOT take the basePath-relative branch
+  // below, which is only for genuinely relative paths (issue #3497).
+  const isWinAbs = WINDOWS_ABS_PATH_RE.test(src)
+  const isLocal = src.startsWith('/') || src.startsWith('~') || src.startsWith('.') || isWinAbs
     || (basePath && !src.startsWith('http'))
   let url: string
   if (isLocal) {
-    if (basePath && !src.startsWith('/') && !src.startsWith('~')) {
-      const resolved = basePath.replace(/\/[^/]*$/, '') + '/' + src
+    // micromark percent-encodes markdown destinations and mdImageDest escapes
+    // literal `%` to `%25`, so one decode recovers the on-disk path before it
+    // is re-encoded into the file-raw query (otherwise the backend receives a
+    // literal `%20` and 404s). decodeLocalPath keeps the raw form on malformed
+    // sequences and on decoded control characters (a `%00` NUL would crash the
+    // backend's realpath).
+    const localPath = decodeLocalPath(src)
+    if (basePath && !src.startsWith('/') && !src.startsWith('~') && !isWinAbs) {
+      const resolved = basePath.replace(/\/[^/]*$/, '') + '/' + localPath
       url = `/api/file-raw?path=${encodeURIComponent(resolved)}`
     } else {
-      url = `/api/file-raw?path=${encodeURIComponent(src)}`
+      url = `/api/file-raw?path=${encodeURIComponent(localPath)}`
     }
     // See ImageVersionCtx: without this every impression of a rewritten file
     // shares one cache entry and a new message renders the previous bytes. The

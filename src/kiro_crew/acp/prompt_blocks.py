@@ -33,7 +33,7 @@ import os
 import re
 from pathlib import Path
 
-from kiro_crew.hooks import safe_read_file_bytes
+from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
 
 try:
     from PIL import Image, ImageOps
@@ -178,14 +178,28 @@ _POSIX_PATH_RE = re.compile(
 # like `the path C:\docs\logo.png is an example` a candidate -- and on Linux a
 # file with that literal name can exist in the CWD, which would inline a file
 # the user only mentioned. Matching the host's own grammar keeps that impossible.
+#
+# The UNC alternative accepts both separators after the leading pair
+# (``\\host\share\...`` and ``//host/share/...``): the dashboard composer
+# serializes image attachments with forward slashes (a markdown destination
+# cannot carry raw backslashes -- CommonMark eats ``\`` before punctuation),
+# and Windows file APIs accept the forward-slash form verbatim. The leading
+# pair likewise accepts ``//``; ``(?<![\w:/])`` guards it from matching inside
+# a URL's ``://``.
 _WINDOWS_PATH_CHARS = r"[\w\\/.@ \t()\-]"
 _WINDOWS_PATH_RE = re.compile(
-    rf"(?<![\w:])((?:[A-Za-z]:[\\/]|\\\\[^\\/:*?\"<>|\r\n]+[\\/])"
+    rf"(?<![\w:])(?:(?<![\w:/]))((?:[A-Za-z]:[\\/]|[\\/]{{2}}[^\\/:*?\"<>|\r\n]+[\\/])"
     rf"{_WINDOWS_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
     re.IGNORECASE,
 )
 
 _PATH_RE = _WINDOWS_PATH_RE if os.name == "nt" else _POSIX_PATH_RE
+
+# Single copy of the UNC trusted-root invariant, shared with the dashboard's
+# file I/O validation: a UNC path names a HOST, so any filesystem call on
+# untrusted text is an outbound SMB probe. See kiro_crew.hooks.
+_is_unc_shape = is_unc_shape
+_unc_probe_allowed = unc_probe_allowed
 
 
 def _downscale_within_limits(raw_bytes: bytes, mime: str, max_edge: int) -> tuple[bytes, str] | None:
@@ -347,6 +361,14 @@ def build_prompt_blocks(
         for match in _PATH_RE.finditer(message):
             raw = match.group(1).strip()
             if raw in seen:
+                continue
+            # UNC-shaped candidates name a HOST on Windows: gate them before
+            # any filesystem call, or is_file() below opens an SMB connection
+            # to attacker-controlled text. POSIX has no such semantics (a
+            # doubled leading slash is an ordinary local path), and _PATH_RE
+            # is platform-gated anyway. See _unc_probe_allowed.
+            if os.name == "nt" and _is_unc_shape(raw) and not _unc_probe_allowed(raw):
+                seen.add(raw)
                 continue
             path = Path(raw)
             suffix = path.suffix.lower()

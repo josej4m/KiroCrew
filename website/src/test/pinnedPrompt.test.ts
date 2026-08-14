@@ -201,6 +201,51 @@ describe('promptImages', () => {
     expect(promptPreview(content)).toBe('before after')
     expect(promptImages(content)).toEqual(['/p/q.png'])
   })
+
+  // mdImageDest (fileTokens.ts) wraps whitespace/special-char destinations in
+  // CommonMark's `<…>` form with `\`, `<`, `>` escaped — issue #3497. This
+  // extractor reads RAW markdown, so it must mirror that producer grammar or
+  // the pinned strip regresses to a broken thumbnail for exactly the paths
+  // the fix makes renderable.
+  it('unwraps an angle-bracket destination (space-containing Windows path)', () => {
+    expect(promptImages('![image](<C:/Users/John Doe/uploads/shot.png>)'))
+      .toEqual(['C:/Users/John Doe/uploads/shot.png'])
+  })
+
+  it('carries parentheses inside the bracketed form to the closing bracket', () => {
+    // `screenshot (1).png` is the default Windows duplicate-name shape; the
+    // plain-destination rule (stop at first `)`) must not apply inside `<…>`.
+    const content = '![image](</tmp/screenshot (1).png>)'
+    expect(promptImages(content)).toEqual(['/tmp/screenshot (1).png'])
+    // The text passes must strip the WHOLE form — no trailing `.png>)` residue.
+    expect(promptPreview(content)).toBe('')
+    expect(promptBody(content)).toBe('')
+  })
+
+  it('undoes producer escapes inside the bracketed form', () => {
+    expect(promptImages('![image](</tmp/my dir\\\\.hidden.png>)'))
+      .toEqual(['/tmp/my dir\\.hidden.png'])
+    expect(promptImages('![image](</tmp/a \\<b\\>.png>)'))
+      .toEqual(['/tmp/a <b>.png'])
+  })
+})
+
+describe('pinnedImageUrl', () => {
+  it('decodes a producer-escaped literal % before re-encoding (mirrors ImgWithFallback)', () => {
+    // mdImageDest escapes % -> %25 in the persisted markdown; the thumbnail
+    // and the bubble's own copy of the image must resolve identically.
+    expect(pinnedImageUrl('/tmp/photo%2520copy.png'))
+      .toBe(`/api/file-raw?path=${encodeURIComponent('/tmp/photo%20copy.png')}`)
+  })
+
+  it('refuses to decode control characters into the query', () => {
+    expect(pinnedImageUrl('/tmp/x%00.png'))
+      .toBe(`/api/file-raw?path=${encodeURIComponent('/tmp/x%00.png')}`)
+  })
+
+  it('passes remote URLs straight through', () => {
+    expect(pinnedImageUrl('https://example.com/x.png')).toBe('https://example.com/x.png')
+  })
 })
 
 describe('promptBody', () => {

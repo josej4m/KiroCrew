@@ -1,4 +1,6 @@
 import type { DisplayItem } from '../pages/chat/types'
+import { decodeLocalPath } from './urlTransform'
+import { unwrapMdImageDest } from './fileTokens'
 
 /**
  * Geometry + selection helpers for the pinned-prompt banner (the most recent
@@ -166,8 +168,14 @@ export const PINNED_PREVIEW_LINES = 3
  * image is stripped from the text AND missed by the thumbnail pass, i.e. silently
  * lost. `g` is set; `matchAll` clones the regex and `replace` resets `lastIndex`
  * itself, so the shared instance carries no state between calls.
+ *
+ * The destination has two CommonMark shapes, mirrored from mdImageDest
+ * (fileTokens.ts): a plain run up to the first `)`, or an angle-bracket form
+ * `<…>` that may contain spaces, parentheses, and backslash-escaped `\<` `\>`
+ * `\\` — the `<…>` alternative must come first, or a wrapped destination
+ * containing `)` (e.g. `</tmp/screenshot (1).png>`) is cut at that paren.
  */
-const IMAGE_MD_RE = /!\[[^\]]*\]\(([^)]*)\)/g
+const IMAGE_MD_RE = /!\[[^\]]*\]\((<(?:\\[\\<>]|[^<>\\])*>|[^)]*)\)/g
 
 /** Fenced code block. Shared so every pass agrees on where code starts and ends. */
 const FENCE_RE = /```[\s\S]*?```/g
@@ -273,7 +281,12 @@ export function promptImages(content: string): string[] {
     // and thumbnailing it invents an image the prompt never carried.
     if (seg.fence) continue
     for (const m of seg.text.matchAll(IMAGE_MD_RE)) {
-      const src = (m[1] || '').trim()
+      // mdImageDest wraps whitespace/special-char destinations in CommonMark's
+      // `<…>` form with `\`, `<`, `>` backslash-escaped. This extractor reads
+      // the RAW markdown (micromark never sees it), so undo that layer with
+      // the shared inverse — otherwise the thumbnail would ask file-raw for a
+      // path with literal angle brackets (issue #3497).
+      const src = unwrapMdImageDest((m[1] || '').trim())
       if (src && !out.includes(src)) out.push(src)
     }
   }
@@ -300,7 +313,12 @@ export function promptImages(content: string): string[] {
 const FILE_RAW_PATH_PREFIX = '/api/file-raw?path='
 
 export function pinnedImageUrl(src: string): string {
+  // Local paths mirror ImgWithFallback's decode: mdImageDest escapes a literal
+  // `%` to `%25` in the persisted markdown, so decode before re-encoding into
+  // the query — otherwise a thumbnail and the bubble's own copy of the image
+  // would resolve differently. decodeLocalPath keeps the raw form on malformed
+  // sequences and decoded control characters.
   return /^(?:https?:|data:|blob:)/i.test(src)
     ? src
-    : FILE_RAW_PATH_PREFIX + encodeURIComponent(src)
+    : FILE_RAW_PATH_PREFIX + encodeURIComponent(decodeLocalPath(src))
 }

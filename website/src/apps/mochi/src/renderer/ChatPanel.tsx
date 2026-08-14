@@ -37,6 +37,8 @@ import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import { rehypeSanitize } from '../../../../components/MarkdownRenderer'
+import { unwrapMdImageDest } from '../../../../utils/fileTokens'
+import { decodeLocalPath } from '../../../../utils/urlTransform'
 import type { ApprovalRequest, ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
 import { PINNED_PANEL_WIDTH } from '../shared/constants'
@@ -1996,10 +1998,15 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
             {isUser
               ? <span style={{ whiteSpace: 'pre-wrap' }}>
                   {text.split(/\n/).map((line, i) => {
-                    // Detect markdown image syntax: ![...](path)
+                    // Detect markdown image syntax: ![...](path). The path may
+                    // be mdImageDest's `<…>`-wrapped form with `%` escaped to
+                    // `%25` (attachmentLines in composerDrop routes uploads
+                    // through it), so undo both layers with the shared
+                    // inverses before handing the on-disk path to LocalImage
+                    // (issue #3497).
                     const mdImgMatch = line.match(/^!\[[^\]]*\]\((.+)\)$/)
                     if (mdImgMatch) {
-                      return <LocalImage key={i} path={mdImgMatch[1]} onClickImage={onImageClick} />
+                      return <LocalImage key={i} path={decodeLocalPath(unwrapMdImageDest(mdImgMatch[1]))} onClickImage={onImageClick} />
                     }
                     // Detect bare image file paths — line starts with / and ends with image extension.
                     const trimmed = line.trim()

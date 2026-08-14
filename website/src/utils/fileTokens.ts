@@ -214,13 +214,57 @@ export interface SendPayload {
   imgPaths: string[]
 }
 
+/** Windows path shapes the PRODUCER normalizes to forward slashes: drive
+ *  letters and UNC shares. Deliberately WIDER than the consumer-side
+ *  `WINDOWS_ABS_PATH_RE` (urlTransform.ts), and that asymmetry is the security
+ *  design, not drift: this regex only ever sees paths returned by our own
+ *  upload endpoint (trusted), while the consumer predicate classifies
+ *  attacker-authorable markdown `src` values and must never admit a
+ *  host-naming UNC shape. A UNC upload is emitted as `//host/share/…`, which
+ *  reaches the renderer as a scheme-less relative URL and is validated against
+ *  the gateway's trusted attachment roots server-side. */
+const WIN_PRODUCER_PATH_RE = /^(?:[A-Za-z]:|\\\\[^\\/]+)[\\/]/
+
+/** Markdown-safe destination for a local image path.
+ *
+ *  Raw paths break `![image](path)` in several ways (issue #3497):
+ *  - CommonMark treats `\` before ASCII punctuation as an escape, so
+ *    `C:\Users\me\.kiro\…` parses with `\.` collapsed to `.` — a mangled
+ *    path. Windows accepts `/` in every file API, so drive-letter and UNC
+ *    paths are emitted in forward-slash form (`\\host\share` → `//host/share`).
+ *  - A literal `%` is ambiguous with percent-encoding once the renderer
+ *    decodes (see decodeLocalPath), so it is escaped to `%25` — that makes
+ *    the decode the exact inverse for every destination this app produces.
+ *  - Whitespace or `(`/`)` ends a plain destination, and `<`, `>`, `\`
+ *    terminate or escape inside CommonMark's `<…>` form — such paths are
+ *    wrapped in `<…>` with those three characters backslash-escaped.
+ */
+export function mdImageDest(p: string): string {
+  let normalized = WIN_PRODUCER_PATH_RE.test(p) ? p.replace(/\\/g, '/') : p
+  normalized = normalized.replace(/%/g, '%25')
+  if (!/[\s()\\<>]/.test(normalized)) return normalized
+  return `<${normalized.replace(/[\\<>]/g, c => '\\' + c)}>`
+}
+
+/** Syntactic inverse of mdImageDest's `<…>` wrap, for consumers that read the
+ *  RAW markdown instead of going through micromark (pinned-prompt thumbnails,
+ *  Mochi's sent-bubble line parser): unwrap the angle brackets and undo the
+ *  `\`, `<`, `>` escapes. Deliberately does NOT percent-decode — that layer
+ *  belongs to decodeLocalPath (urlTransform.ts), exactly as in the rendered
+ *  path where micromark does the syntax and ImgWithFallback the decode, so a
+ *  consumer never double-decodes. */
+export function unwrapMdImageDest(dest: string): string {
+  const m = dest.match(/^<([\s\S]*)>$/)
+  return m ? m[1].replace(/\\([\\<>])/g, '$1') : dest
+}
+
 export function prepareSendPayload(raw: string, pendingFiles: string[]): SendPayload {
   // All pending files (uploaded via button/drag-drop) are always included.
   // The @-token in text is used for display replacement, not as a gate.
   const files = [...new Set(pendingFiles)]
   const imgPaths = files.filter(p => IMG_EXT.test(p))
   const filePaths = files.filter(p => !IMG_EXT.test(p))
-  const imgMd = imgPaths.map(p => `![image](${p})`).join('\n')
+  const imgMd = imgPaths.map(p => `![image](${mdImageDest(p)})`).join('\n')
   const relMap = buildRelMap(files, raw)
 
   // Assign sequential indices to all non-image files, ordered by upload order.
