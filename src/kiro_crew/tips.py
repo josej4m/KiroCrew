@@ -247,7 +247,7 @@ def _load_state() -> TipsState:
             if isinstance(k, str) and (fv := _finite(v)) is not None
         }
 
-        return TipsState(
+        st = TipsState(
             shown=shown,
             dismissed=dismissed,
             dismissed_docs=dismissed_docs,
@@ -263,9 +263,53 @@ def _load_state() -> TipsState:
             ],
             offered=_sanitize_persisted_tip(data.get("offered")),
         )
+        _migrate_relinked_curated_state(st)
+        return st
     except (OSError, ValueError, TypeError, OverflowError):
         # ValueError covers json.JSONDecodeError; OverflowError defense-in-depth.
         return TipsState()
+
+
+# Curated tips whose learn-more doc moved from "doc" (dismissal identity) to
+# "doc_link" (rendering-only). State written by the pre-move shape can still
+# carry the catalog doc as these tips' identity, keeping the cross-suppression
+# the split fixes alive across the upgrade; _load_state migrates it.
+_RELINKED_CURATED_DOCS: dict[str, str] = {
+    "subagent-parallelism": "dynamic-subagent-sizing.md",
+    "zero-token-cron": "cron-and-scheduling.md",
+}
+
+
+def _migrate_relinked_curated_state(st: TipsState) -> None:
+    """Repair persisted state that predates the doc -> doc_link split.
+
+    Three shapes carry the old collision:
+    - a held-over copy of the old tip (offered slot / cached pool) whose
+      dismissal would re-record the catalog doc: move doc -> doc_link;
+    - a shown_docs entry mapping the curated id to the catalog doc (the same
+      re-recording path): drop it;
+    - a doc-level dismissal recorded by dismissing the curated tip: lift it
+      when the curated id is dismissed and the catalog's own tip id is not,
+      so the catalog tip stops being collateral. The curated tip itself stays
+      dismissed by id. When an LLM-generated tip about the same doc also
+      recorded the entry, lifting it resurfaces that feature once under a
+      fresh id — the same trade the split itself makes.
+
+    snoozed_docs is deliberately left alone: snoozes expire on their own.
+    """
+    candidates: list[dict] = [t for t in st.tips if isinstance(t, dict)]  # type: ignore[type-arg]
+    if isinstance(st.offered, dict):
+        candidates.append(st.offered)
+    for tid, doc in _RELINKED_CURATED_DOCS.items():
+        for t in candidates:
+            if t.get("id") == tid and t.get("doc") == doc:
+                t["doc"] = ""
+                t["doc_link"] = doc
+        if st.shown_docs.get(tid) == doc:
+            del st.shown_docs[tid]
+        catalog_tid = doc.replace(".md", "-tip")
+        if tid in st.dismissed and doc in st.dismissed_docs and catalog_tid not in st.dismissed:
+            st.dismissed_docs.remove(doc)
 
 
 def _save_state(st: TipsState) -> None:
@@ -377,7 +421,8 @@ def _load_curated_tips() -> list[dict]:  # type: ignore[type-arg]
     These cover KiroCrew-native features (keyboard shortcuts, Settings toggles,
     config keys) that have no docs/*.md entry and so can never surface through
     the doc-scan catalog. Each entry is validated through the SAME field checks
-    as generated tips (all seven fields as strings; id/title/body non-empty).
+    as generated tips (the allowlisted fields as strings, with optional fields
+    defaulting to ""; id/title/body non-empty).
     Returns [] if the file is missing or malformed — a bad file must never
     crash cache init or take down the tips endpoints.
     """
@@ -525,7 +570,19 @@ def _build_context(state: DashboardState) -> str:
 # The ONLY fields a tip dict may carry end-to-end (parse → persist → serve).
 # _parse_tips projects onto exactly this set so unknown/nested LLM output can
 # never bypass string redaction or reach the dashboard.
-_TIP_ALLOWED_FIELDS = ("id", "feature", "title", "body", "why", "doc", "cta_prompt")
+#
+# "doc" and "doc_link" split two jobs that must not share one field: "doc" is
+# the tip's DISMISSAL IDENTITY (recorded into dismissed_docs / snoozed_docs and
+# consulted by _is_eligible), while "doc_link" is purely a rendering hint for
+# the dashboard's "learn more" link and is never read by the dismissal path.
+# A curated tip that links a doc the catalog also owns must use "doc_link", so
+# dismissing it cannot suppress the catalog's own tip for that doc.
+_TIP_ALLOWED_FIELDS = ("id", "feature", "title", "body", "why", "doc", "doc_link", "cta_prompt")
+
+# Fields that may be absent from older persisted state or curated entries:
+# validation defaults a missing value to "" instead of rejecting the tip, so
+# tips authored before the field existed keep loading.
+_TIP_OPTIONAL_FIELDS = ("doc_link",)
 
 
 def _parse_tips(text: str) -> list[dict]:  # type: ignore[type-arg]
@@ -545,15 +602,11 @@ def _parse_tips(text: str) -> list[dict]:  # type: ignore[type-arg]
                 if not _validate_tip_fields(t):
                     continue
                 # Allowlist projection: keep ONLY the
-                # seven allowed string fields. Unknown/extra fields from the
+                # allowed string fields. Unknown/extra fields from the
                 # LLM (including nested dicts) would bypass _redact_tips's
                 # string-only redaction and reach persistence + the dashboard.
                 t = {k: t[k] for k in _TIP_ALLOWED_FIELDS}
-                # Sanitize doc: only allow http(s) URLs or relative .md filenames
-                doc = t.get("doc", "")
-                if isinstance(doc, str) and doc:
-                    if not (re.match(r"^https?://", doc) or re.match(r"^[\w./-]+\.md$", doc)):
-                        t["doc"] = ""
+                _sanitize_tip_links(t)
                 valid.append(t)
             return valid[:_MAX_GENERATED_TIPS]
     except (json.JSONDecodeError, TypeError):
@@ -570,24 +623,39 @@ _TIP_FIELD_LIMITS: dict[str, int] = {
     "body": 1000,
     "why": 1000,
     "doc": 1000,
+    "doc_link": 1000,
     "cta_prompt": 1000,
 }
 
 _TIP_REQUIRED_NONEMPTY = ("id", "title", "body")
 
 
+def _sanitize_tip_links(t: dict) -> None:  # type: ignore[type-arg]
+    """Clear a doc/doc_link value that is neither an http(s) URL nor a relative
+    .md filename. Applied to generated AND persisted/curated tips so the
+    link-shape invariant holds regardless of where a tip came from; the
+    dashboard re-validates before rendering (defense in depth).
+    """
+    for link_field in ("doc", "doc_link"):
+        val = t.get(link_field, "")
+        if isinstance(val, str) and val:
+            if not (re.match(r"^https?://", val) or re.match(r"^[\w./-]+\.md$", val)):
+                t[link_field] = ""
+
+
 def _sanitize_persisted_tip(t: object) -> dict | None:  # type: ignore[type-arg]
     """Normalize a tip dict loaded from disk through the SAME validation as
     generated tips: required string fields, length caps,
-    allowlist projection. Returns None for anything invalid — a malformed
-    persisted tip like {"id": []} must be discarded, not crash _is_eligible
-    with a 500 on every request.
+    allowlist projection, link-shape sanitization. Returns None for anything
+    invalid — a malformed persisted tip like {"id": []} must be discarded,
+    not crash _is_eligible with a 500 on every request.
     """
     if not isinstance(t, dict):
         return None
     if not _validate_tip_fields(t):
         return None
     out = {k: t[k] for k in _TIP_ALLOWED_FIELDS}
+    _sanitize_tip_links(out)
     action = _sanitize_tip_action(t.get("action"))
     if action is not None:
         out["action"] = action
@@ -595,10 +663,17 @@ def _sanitize_persisted_tip(t: object) -> dict | None:  # type: ignore[type-arg]
 
 
 def _validate_tip_fields(t: dict) -> bool:  # type: ignore[type-arg]
-    """Validate that all required tip fields are strings within length bounds."""
+    """Validate that all tip fields are strings within length bounds.
+
+    Fields in _TIP_OPTIONAL_FIELDS default to "" when absent (or null) so
+    entries authored before a field existed keep loading; a present
+    non-string value still rejects the tip.
+    """
     required = _TIP_ALLOWED_FIELDS
     for k in required:
         v = t.get(k)
+        if v is None and k in _TIP_OPTIONAL_FIELDS:
+            t[k] = v = ""
         if not isinstance(v, str):
             return False
         limit = _TIP_FIELD_LIMITS.get(k, 1000)
@@ -613,7 +688,7 @@ def _validate_tip_fields(t: dict) -> bool:  # type: ignore[type-arg]
 
 # Optional per-tip action button. A single 'route' kind for now: a button that
 # navigates to an internal dashboard path (the exact settings tab/control, a
-# page, etc.). Validated separately from the seven string fields because it is
+# page, etc.). Validated separately from the flat string fields because it is
 # a nested object. Absent/invalid -> no button rendered. Curated tips carry
 # hand-authored actions; LLM-generated tips never get one, so no invented route
 # can reach the client.
@@ -680,6 +755,7 @@ def _fallback_tips(catalog: list[CatalogEntry], st: TipsState) -> list[dict]:  #
                 "body": entry.summary,
                 "why": "",
                 "doc": entry.doc,
+                "doc_link": "",
                 "cta_prompt": f"Tell me about {entry.feature}",
             }
         )
@@ -693,7 +769,9 @@ def _is_eligible(
     tid = tip.get("id", "")
     if tid in st.dismissed:
         return False
-    # Doc-level dismissal: stable across LLM regenerations that invent new ids
+    # Doc-level dismissal: stable across LLM regenerations that invent new ids.
+    # Keys on "doc" ONLY — "doc_link" is a rendering hint and never suppresses,
+    # so a curated tip linking a catalog doc cannot take that doc's tip down.
     doc = tip.get("doc", "")
     if doc and doc in st.dismissed_docs:
         return False
