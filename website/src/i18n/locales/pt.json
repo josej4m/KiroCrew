@@ -326,7 +326,9 @@
     "tab_title": "{{label}} — {{productName}}",
     "tab_title_chat": "Chat",
     "tab_title_session": "{{session}} — {{panel}}",
-    "release_notes_not_published_yet": "As notas da versão {{release}} ainda não foram publicadas. Mostrando as notas da {{shown}} em seu lugar."
+    "release_notes_not_published_yet": "As notas da versão {{release}} ainda não foram publicadas. Mostrando as notas da {{shown}} em seu lugar.",
+    "titlebar_menu_disabled_footer": "Alguns itens funcionam apenas na janela principal. Os atalhos exibidos continuam funcionando.",
+    "titlebar_menu_refused_notice": "\"{{item}}\" não foi executado. Use este comando na sua janela principal do {{productName}}."
   },
   "appSdk": {
     "chatEmbed": {

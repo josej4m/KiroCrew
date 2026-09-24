@@ -340,7 +340,9 @@
     "tab_title": "{{label}} — {{productName}}",
     "tab_title_chat": "Чат",
     "tab_title_session": "{{session}} — {{panel}}",
-    "release_notes_not_published_yet": "Заметки о выпуске {{release}} ещё не опубликованы. Вместо них показаны заметки о выпуске {{shown}}."
+    "release_notes_not_published_yet": "Заметки о выпуске {{release}} ещё не опубликованы. Вместо них показаны заметки о выпуске {{shown}}.",
+    "titlebar_menu_disabled_footer": "Некоторые пункты работают только в главном окне. Показанные сочетания клавиш по-прежнему работают.",
+    "titlebar_menu_refused_notice": "«{{item}}» не выполнено. Используй эту команду в главном окне {{productName}}."
   },
   "appSdk": {
     "chatEmbed": {
