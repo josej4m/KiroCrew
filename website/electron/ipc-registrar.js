@@ -313,17 +313,53 @@ function createIpcRegistrar({
       return verdict === true && generationUnchanged;
     }
 
+    // A port-owner probe that could not NAME a holder is not evidence of a
+    // foreign one. `unknown` is the probe itself failing (netstat locale,
+    // PowerShell policy timeout); `none` is the primary port briefly unbound
+    // while our gateway restarts. Neither proves a foreign holder, so neither
+    // revokes the last positive this WebContents earned, and the paint path
+    // keeps drawing the local user's rows enabled instead of greying them over
+    // a hiccup. Neither proves OUR gateway holds the port either, so neither
+    // authorizes an action: a probe failure can coincide with a foreign
+    // listener, and only a fresh `local` outcome may unlock a LOCAL_ONLY leaf.
+    const INCONCLUSIVE_PORT_OWNERS = new Set(["unknown", "none"]);
+
+    // Turn a probe outcome into a verdict for THIS WebContents. Only `local`
+    // authorizes. `inconclusive` refuses but leaves the last positive in place
+    // for painting; `refused` also drops it, so a later inconclusive probe
+    // cannot keep painting rows enabled after a foreign holder was proven.
+    //
+    // The kept positive is bounded. Rows painted enabled while every click is
+    // refused is a dead menu with nothing on screen to explain it, so past
+    // `INCONCLUSIVE_PAINT_GRACE_MS` beyond the positive's own window it is
+    // dropped and the rows grey with the footer. The grace covers a gateway
+    // restart; a probe that keeps failing longer than that is shown, not hidden.
+    const INCONCLUSIVE_PAINT_GRACE_MS = 30_000;
+
+    function positiveIsPaintable(wc) {
+      const mintedAt = senderIsLocalCache.get(wc);
+      return mintedAt !== undefined
+        && Date.now() - mintedAt < POSITIVE_VERDICT_TTL_MS + INCONCLUSIVE_PAINT_GRACE_MS;
+    }
+
+    function settleProbeOutcome(wc, outcome) {
+      if (outcome === "local") return true;
+      if (outcome !== "inconclusive" || !positiveIsPaintable(wc)) {
+        senderIsLocalCache.delete(wc);
+      }
+      return false;
+    }
+
     async function resolveSenderIsLocal(event, channel) {
       const wc = event && event.sender;
       if (!wc) return false;
-      // A positive is reusable only while it is fresh. Falling through on a
-      // lapsed entry re-runs all three gates, which is what re-establishes the
-      // port-ownership fact nothing else can invalidate. Deleting it here keeps
-      // the map from holding a verdict that can no longer answer anything.
+      // A positive answers on its own only while it is fresh. A lapsed entry is
+      // KEPT as the last positive (see settleProbeOutcome) but falls through to
+      // a fresh three-gate probe, which is what re-establishes the
+      // port-ownership fact nothing else can invalidate.
       const mintedAt = senderIsLocalCache.get(wc);
-      if (mintedAt !== undefined) {
-        if (Date.now() - mintedAt < POSITIVE_VERDICT_TTL_MS) return true;
-        senderIsLocalCache.delete(wc);
+      if (mintedAt !== undefined && Date.now() - mintedAt < POSITIVE_VERDICT_TTL_MS) {
+        return true;
       }
       const inFlight = senderIsLocalInFlight.get(wc);
       if (inFlight) {
@@ -331,8 +367,8 @@ function createIpcRegistrar({
         // creator does. Otherwise a navigation completing between the probe
         // START (creator's genAtStart) and the joiner receiving the verdict
         // would let a raw `true` reach a now-remote document.
-        const joinerVerdict = await inFlight.promise;
-        return applyGenerationGuard(wc, joinerVerdict, inFlight.genAtStart);
+        const joinerOutcome = await inFlight.promise;
+        return applyGenerationGuard(wc, settleProbeOutcome(wc, joinerOutcome), inFlight.genAtStart);
       }
       // Wire the invalidation BEFORE the probe and seed the generation, so
       // any navigation that lands during the probe increments the counter
@@ -383,23 +419,25 @@ function createIpcRegistrar({
       // the probe resolves, regardless of the verdict — leaving a stale
       // in-flight entry would freeze subsequent probes on a resolved promise.
       const probe = (async () => {
-        let verdict = false;
         try {
           await assertLocalDashboard(event, channel);
-          verdict = true;
-        } catch {
-          // The gate already logged the reject through glog; the caller
-          // treats a `false` verdict as the LOCAL_ONLY refusal signal.
+          return "local";
+        } catch (err) {
+          // The gate already logged the reject through glog. A gate-3 refusal
+          // carries the classified owner, which is what separates "could not
+          // tell" from "someone else holds the port".
+          if (err && INCONCLUSIVE_PORT_OWNERS.has(err.portOwner)) return "inconclusive";
+          return "refused";
         }
-        return verdict;
       })();
       senderIsLocalInFlight.set(wc, { promise: probe, genAtStart });
-      let verdict;
+      let outcome;
       try {
-        verdict = await probe;
+        outcome = await probe;
       } finally {
         senderIsLocalInFlight.delete(wc);
       }
+      const verdict = settleProbeOutcome(wc, outcome);
       // Cache only positive verdicts, and only when no navigation completed
       // during the probe (see the header comment). A `false` re-probes on
       // the next call — cheap, and it survives a transient probe failure
@@ -407,7 +445,8 @@ function createIpcRegistrar({
       // titlebar menu since SPA route changes fire `did-navigate-in-page`
       // rather than `did-navigate`. The stored value is the mint time, which
       // is what bounds how long gate 3's mutable port-ownership fact may be
-      // taken on trust.
+      // taken on trust. Only a proven local owner mints or re-mints it; a
+      // positive kept through an inconclusive probe keeps its old mint time.
       const guarded = applyGenerationGuard(wc, verdict, genAtStart);
       if (guarded) {
         senderIsLocalCache.set(wc, Date.now());
@@ -427,8 +466,28 @@ function createIpcRegistrar({
     // rather than enabled ones that silently no-op on click. Async only
     // because the first call on a sender WebContents warms the cache
     // through `assertLocalDashboard`; subsequent calls are synchronous.
+    //
+    // Painting the rows never waits on a re-probe. When this WebContents holds
+    // a last positive that has merely aged out, the rows paint from it and the
+    // re-probe runs in the background, so opening the menu after an idle gap
+    // costs no netstat/PowerShell wait. This is safe because `items` only
+    // decides how a row LOOKS: every click goes through `app-menu:execute`,
+    // which never answers from a lapsed positive — it joins that same
+    // in-flight probe and refuses when it finds a foreign holder. The one
+    // stale paint that remains is a row drawn enabled for a single open after
+    // a foreign process took the port; clicking it is still refused.
+    function resolveSenderIsLocalForPaint(event, channel) {
+      const wc = event && event.sender;
+      if (wc && positiveIsPaintable(wc)) {
+        // resolveSenderIsLocal never rejects; a fresh entry returns without
+        // probing, a lapsed one starts (or joins) the single-flight re-probe.
+        resolveSenderIsLocal(event, channel);
+        return true;
+      }
+      return resolveSenderIsLocal(event, channel);
+    }
     ipcMain.handle("app-menu:items", async (event, id) => {
-      const senderIsLocal = await resolveSenderIsLocal(event, "app-menu:items");
+      const senderIsLocal = await resolveSenderIsLocalForPaint(event, "app-menu:items");
       return windows.menu.items(event.sender, id, senderIsLocal);
     });
     ipcMain.on("app-menu:execute", (event, id, index) => {
@@ -572,7 +631,12 @@ function createIpcRegistrar({
           `${channel} rejected: :${port} held by ${portOwner}, `
           + "not this shell's gateway",
         );
-        throw new Error(`${channel} is restricted to the local dashboard`);
+        // Every caller still sees a refusal. The classified owner rides along
+        // only so the app-menu gate can tell an inconclusive probe from a
+        // foreign holder; the other channels ignore it and stay fail-closed.
+        const refusal = new Error(`${channel} is restricted to the local dashboard`);
+        refusal.portOwner = portOwner;
+        throw refusal;
       }
     }
 
