@@ -342,6 +342,87 @@ test("dev-mode-changed is refused for a remote sender", async () => {
   );
 });
 
+// `dev-mode-changed` flips the VISIBILITY of the DevTools row, and visibility is
+// cosmetic in exactly the way `app-menu:items` is: the click it reveals still
+// goes through `app-menu:execute`, which re-resolves and refuses on its own. So
+// an inconclusive gate-3 probe must not read as a refusal here. A probe only
+// reaches `inconclusive` AFTER gates 1 and 2 have passed, so the sender is
+// already proven to be the local dashboard on a local gateway; the single
+// unproven fact is who holds the port.
+//
+// Collapsing that into "remote" costs the local user the row for the whole
+// SESSION rather than one menu open: `useDeveloperMode` syncs dev mode once on
+// mount with empty deps and never retries, so one transient netstat/PowerShell
+// failure at startup hides DevTools until the app is restarted.
+test("dev-mode-changed still flips visibility when the port's holder cannot be named", async () => {
+  for (const owner of ["unknown", "none", "unidentified"]) {
+    const h = harness({ storeValues: { runLocalGateway: true }, primaryPortOwner: owner });
+    h.registrar.registerShell();
+    const event = localSenderEvent(`devmode-${owner}`);
+
+    h.listeners.get("dev-mode-changed")(event, true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.setDevMode").slice(1),
+      [true],
+      `${owner}: an unnameable holder must not cost the local user the DevTools row`,
+    );
+  }
+});
+
+// The other half of the same predicate. `inconclusive` is soft here; a PROVEN
+// foreign holder is not. Without this the case above would read as a blanket
+// bypass of gate 3 rather than a narrowing of what counts as a refusal.
+test("dev-mode-changed is still refused when a foreign holder is proven", async () => {
+  const h = harness({ storeValues: { runLocalGateway: true }, primaryPortOwner: "foreign" });
+  h.registrar.registerShell();
+  const event = localSenderEvent("devmode-foreign");
+
+  h.listeners.get("dev-mode-changed")(event, true);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    h.windowCalls.some(([name]) => name === "menu.setDevMode"),
+    false,
+    "a proven foreign holder must still refuse the visibility flip",
+  );
+});
+
+// The soft pass carries the SAME navigation guard the authorizing path does. A
+// probe that began while the sender was the local dashboard and came back
+// inconclusive after a cross-origin navigation committed describes a document
+// the caller has already left, so its soft pass must not survive. Driven
+// behaviourally: the navigation commits while the probe is still in flight.
+test("dev-mode-changed refuses an inconclusive probe a navigation landed during", async () => {
+  const h = harness({ storeValues: { runLocalGateway: true } });
+  h.registrar.registerShell();
+  const navigationHandlers = [];
+  const senderFrame = { url: "http://localhost:5476/chat" };
+  const sender = {
+    id: "devmode-navigated",
+    mainFrame: senderFrame,
+    on(eventName, handler) { navigationHandlers.push([eventName, handler]); },
+  };
+  const event = { sender, senderFrame };
+  h.gateway.probePrimaryPortOwner = (...args) => {
+    h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+    for (const [eventName, handler] of navigationHandlers) {
+      if (eventName === "did-navigate") handler();
+    }
+    return Promise.resolve("unknown");
+  };
+
+  h.listeners.get("dev-mode-changed")(event, true);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    h.windowCalls.some(([name]) => name === "menu.setDevMode"),
+    false,
+    "a navigation during the probe must revoke the inconclusive soft pass",
+  );
+});
+
 // A cached POSITIVE verdict asserts three facts, and one of them is mutable
 // independently of the sender: gate 3's port ownership. Gates 1 and 2 are
 // properties of the PAGE, so a navigation invalidates them and the cache is
@@ -422,17 +503,193 @@ test("a lapsed positive whose port owner has changed resolves to not-local", asy
     };
     Date.now = () => t0 + 5_001;
 
-    await h.handlers.get("app-menu:items")(event, "file-menu");
+    // The click is the real gate: a lapsed positive must not answer it.
+    h.handlers.get("app-menu:execute")(event, "edit-menu", 2);
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(
-      lastCall(h.windowCalls, "menu.items").slice(1),
-      [event.sender, "file-menu", /*senderIsLocal*/ false],
+      lastCall(h.windowCalls, "menu.execute").slice(1),
+      [event.sender, "edit-menu", 2, /*senderIsLocal*/ false],
       "once a foreign listener owns the primary port the verdict MUST flip — a "
         + "stale `true` here keeps unlocking clipboard read and DevTools against "
         + "a port this shell no longer owns",
     );
+
+    // The foreign finding revoked the last positive, so the next paint greys.
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ false],
+      "a revoked positive must not keep painting LOCAL_ONLY rows enabled",
+    );
     assert.ok(
       h.logs.some((line) => line.includes("held by foreign")),
       "the re-probe's rejection must be logged so the flip is attributable",
+    );
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+// After an idle gap the menu must paint without
+// waiting on the netstat/PowerShell probe. The probe below never settles, so a
+// paint that awaited it would hang this test.
+test("a lapsed positive paints the menu without waiting on the re-probe", async () => {
+  const h = harness({ storeValues: { runLocalGateway: true } });
+  h.registrar.registerShell();
+  const event = localSenderEvent();
+
+  const realDateNow = Date.now;
+  const t0 = realDateNow.call(Date);
+  Date.now = () => t0;
+  try {
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    h.gateway.probePrimaryPortOwner = (...args) => {
+      h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+      return new Promise(() => {});
+    };
+    Date.now = () => t0 + 10_000;
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ true],
+    );
+    assert.equal(probeCount(h), 2, "the paint must still start a background re-probe");
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+// A probe that cannot name the holder (`unknown`) or finds the port briefly
+// unbound while our gateway restarts (`none`) is no evidence of a foreign one,
+// so it must not grey the local window's own menu. It is no proof of OUR
+// ownership either, so it must not authorize a click: a probe failure can
+// coincide with a foreign listener on the port.
+test("an inconclusive re-probe refuses the action but keeps the rows painted", async () => {
+  for (const owner of ["unknown", "none"]) {
+    const h = harness({ storeValues: { runLocalGateway: true } });
+    h.registrar.registerShell();
+    const event = localSenderEvent(`inconclusive-${owner}`);
+
+    const realDateNow = Date.now;
+    const t0 = realDateNow.call(Date);
+    Date.now = () => t0;
+    try {
+      await h.handlers.get("app-menu:items")(event, "file-menu");
+      h.gateway.probePrimaryPortOwner = (...args) => {
+        h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+        return Promise.resolve(owner);
+      };
+      Date.now = () => t0 + 5_001;
+      h.handlers.get("app-menu:execute")(event, "edit-menu", 2);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        lastCall(h.windowCalls, "menu.execute").slice(1),
+        [event.sender, "edit-menu", 2, /*senderIsLocal*/ false],
+        `${owner}: only a fresh local owner may authorize a LOCAL_ONLY action`,
+      );
+
+      await h.handlers.get("app-menu:items")(event, "file-menu");
+      assert.deepEqual(
+        lastCall(h.windowCalls, "menu.items").slice(1),
+        [event.sender, "file-menu", /*senderIsLocal*/ true],
+        `${owner}: an inconclusive probe must not grey the local user's rows`,
+      );
+
+      // Kept, not re-minted: the next action probes again instead of trusting
+      // the inconclusive gap for a fresh window. Let the paint's background
+      // re-probe settle first, or the action joins it instead of probing.
+      await new Promise((resolve) => setImmediate(resolve));
+      const before = probeCount(h);
+      h.handlers.get("app-menu:execute")(event, "edit-menu", 2);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(probeCount(h), before + 1, `${owner}: a kept positive must not be re-minted`);
+    } finally {
+      Date.now = realDateNow;
+    }
+  }
+});
+
+// A kept positive paints rows the click path refuses, so it may only outlast a
+// short restart-sized gap. A probe that keeps failing must grey the rows (with
+// the footer explaining them) rather than leave a menu that silently does nothing.
+test("an inconclusive probe stops painting rows enabled after the grace period", async () => {
+  const h = harness({ storeValues: { runLocalGateway: true } });
+  h.registrar.registerShell();
+  const event = localSenderEvent("inconclusive-past-grace");
+
+  const realDateNow = Date.now;
+  const t0 = realDateNow.call(Date);
+  Date.now = () => t0;
+  try {
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    h.gateway.probePrimaryPortOwner = (...args) => {
+      h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+      return Promise.resolve("unknown");
+    };
+    Date.now = () => t0 + 34_999;
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ true],
+      "inside the grace a restart-sized probe gap must not grey the rows",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    Date.now = () => t0 + 35_001;
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ false],
+      "past the grace an inconclusive probe must grey the rows, never paint a dead menu",
+    );
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test("an inconclusive probe with no earned positive still fails closed", async () => {
+  for (const owner of ["unknown", "none"]) {
+    const h = harness({ storeValues: { runLocalGateway: true }, primaryPortOwner: owner });
+    h.registrar.registerShell();
+    const event = localSenderEvent(`first-${owner}`);
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ false],
+      `${owner}: a first call has no positive to keep and must refuse`,
+    );
+  }
+});
+
+test("a foreign finding is not undone by a later inconclusive probe", async () => {
+  const h = harness({ storeValues: { runLocalGateway: true } });
+  h.registrar.registerShell();
+  const event = localSenderEvent();
+  const owners = ["foreign", "unknown"];
+  const realDateNow = Date.now;
+  const t0 = realDateNow.call(Date);
+  Date.now = () => t0;
+  try {
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    h.gateway.probePrimaryPortOwner = (...args) => {
+      h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+      return Promise.resolve(owners.shift());
+    };
+    Date.now = () => t0 + 5_001;
+    h.handlers.get("app-menu:execute")(event, "edit-menu", 2);
+    await new Promise((resolve) => setImmediate(resolve));
+    h.handlers.get("app-menu:execute")(event, "edit-menu", 2);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.execute").slice(1),
+      [event.sender, "edit-menu", 2, /*senderIsLocal*/ false],
+      "a positive revoked by a foreign holder must stay revoked through an unknown probe",
+    );
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ false],
+      "an unknown probe must not bring back enabled rows a foreign holder revoked",
     );
   } finally {
     Date.now = realDateNow;
@@ -765,6 +1022,124 @@ test("a navigation landing DURING the probe forces the returned verdict to false
     "the guarded-away verdict must not be cached — a cached positive here "
       + "would let the now-remote document paint LOCAL_ONLY rows enabled",
   );
+});
+
+// buluoray Blocking 1 on cb31d4f18a: an idle gap must not put the menu back on
+// the probe's critical path. Paint lifetime is separated from the inconclusive
+// grace — age ALONE never greys a positive, because age is not evidence of
+// anything. Only a probe that comes back inconclusive starts the grace clock,
+// and only a proven foreign holder revokes outright (both pinned by the two
+// tests above, which must keep passing unchanged).
+//
+// The probe here never settles, so an implementation that awaited it would lose
+// the race below. Raced against a fixed number of macrotask turns rather than a
+// wall-clock timer: the paint path resolves in microtasks when correct, so the
+// outcome is deterministic and a regression FAILS instead of hanging the run.
+test("a positive well past the grace still paints without waiting on the re-probe", async () => {
+  const afterMacrotaskTurns = async (turnCount) => {
+    for (let turn = 0; turn < turnCount; turn += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return "waited-on-the-probe";
+  };
+
+  const h = harness({ storeValues: { runLocalGateway: true } });
+  h.registrar.registerShell();
+  const event = localSenderEvent("aged-positive-never-contradicted");
+
+  const realDateNow = Date.now;
+  const t0 = realDateNow.call(Date);
+  Date.now = () => t0;
+  try {
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    h.gateway.probePrimaryPortOwner = (...args) => {
+      h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+      return new Promise(() => {});
+    };
+    // Ten minutes — far past POSITIVE_VERDICT_TTL_MS + INCONCLUSIVE_PAINT_GRACE_MS,
+    // and an ordinary gap between two real menu opens rather than an edge case.
+    Date.now = () => t0 + 600_000;
+
+    const outcome = await Promise.race([
+      h.handlers.get("app-menu:items")(event, "file-menu").then(() => "painted"),
+      afterMacrotaskTurns(8),
+    ]);
+    assert.equal(
+      outcome,
+      "painted",
+      "an aged positive the probe has never contradicted must paint immediately, "
+        + "not wait on a fresh netstat/PowerShell round trip",
+    );
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ true],
+      "age alone must not grey a positive no probe has contradicted",
+    );
+    assert.equal(probeCount(h), 2, "the paint must still start a background re-probe");
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+// Spock TEST-01 on 77860a6bf5: the two tests above both exercise the age-and-mark
+// logic, and NEITHER touches the line that clears the mark. Deleting
+// `senderProbeInconclusive.delete(wc)` from the `local` branch of
+// `settleProbeOutcome` left both suites green, and what that mutation breaks is
+// this PR's own goal: any WebContents that ever saw ONE inconclusive probe would
+// be bounded by the grace forever after, re-greying on exactly the idle gap
+// Blocking 1 exists to fix. The invariant is sound -- a cache write needs
+// `verdict === true`, which needs `outcome === "local"`, whose branch clears the
+// mark first -- but soundness nobody asserts is one edit from being gone.
+//
+// The final probe outcome is set EXPLICITLY rather than left to an exhausted
+// queue. It is the discriminator: on pristine source the paint answers from the
+// cleared mark and never reaches a probe, while under the mutation it falls
+// through and awaits one, so that outcome decides whether the mutant is caught.
+// An outcome of `kirocrew` there would re-mint and hand the mutant a passing
+// `true` -- the pin would assert nothing.
+test("a positive re-earned after an inconclusive probe paints at any age", async () => {
+  const h = harness({ storeValues: { runLocalGateway: true } });
+  h.registrar.registerShell();
+  const event = localSenderEvent("remint-after-inconclusive");
+
+  const realDateNow = Date.now;
+  const t0 = realDateNow.call(Date);
+  Date.now = () => t0;
+  try {
+    // Mint a positive from the harness default owner.
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+
+    // One inconclusive probe, which sets the mark.
+    let nextOwner = "unknown";
+    h.gateway.probePrimaryPortOwner = (...args) => {
+      h.gatewayCalls.push(["probePrimaryPortOwner", ...args]);
+      return Promise.resolve(nextOwner);
+    };
+    Date.now = () => t0 + 5_001;
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // A proven local owner re-mints AND must clear the mark.
+    nextOwner = "kirocrew";
+    Date.now = () => t0 + 10_000;
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Well past mint + 35s. Pristine source paints from the cleared mark without
+    // probing; the mutant takes the grace branch, probes, and this inconclusive
+    // answer drops the positive and greys the rows.
+    nextOwner = "unknown";
+    Date.now = () => t0 + 610_000;
+    await h.handlers.get("app-menu:items")(event, "file-menu");
+    assert.deepEqual(
+      lastCall(h.windowCalls, "menu.items").slice(1),
+      [event.sender, "file-menu", /*senderIsLocal*/ true],
+      "a proven local owner must clear the inconclusive mark, so the re-earned "
+        + "positive is bounded by a contradicting probe and never by age",
+    );
+  } finally {
+    Date.now = realDateNow;
+  }
 });
 // Converting `app-menu:execute` from a synchronous `ipcMain.on` into an async
 // `handle` opened a window between the REQUEST and the DISPATCH. The custom
